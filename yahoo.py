@@ -12,6 +12,8 @@ import requests.exceptions
 import sys
 import time
 import urllib
+import re
+
 if (sys.version_info < (3, 0)):
     from cookielib import LWPCookieJar
     from HTMLParser import HTMLParser
@@ -52,66 +54,92 @@ def get_best_photoinfo(photoInfoArr, exclude=[]):
         return best
 
 
-def archive_email(yga, save=True, html=True):
+def archive_messages_metadata(yga):
+    logger = logging.getLogger('archive_message_metadata')
+    params = {'sortOrder': 'asc', 'direction': 1, 'count': 1000}
+
+    message_ids = []
+    next_page_start = float('inf')
+    page_count = 0
+
+    logger.info("Archiving message metadata...")
+
+    while next_page_start > 0:
+        msgs = yga.messages(**params)
+
+        with open("message_metadata_%s.json" % page_count, 'wb') as f:
+            json.dump(msgs, codecs.getwriter('utf-8')(f), ensure_ascii=False, indent=4)
+
+        next_page_start = params['start'] = msgs['nextPageStart']
+        message_ids += [msg['messageId'] for msg in msgs['messages']]
+        page_count += 1
+
+        logger.info("Archived message metadata records (%d of %d)", len(message_ids), msgs['totalRecords'])
+
+    return message_ids
+
+
+def archive_message_content(yga, id):
+    logger = logging.getLogger('archive_message_content')
+    logger.info("Fetching raw message #%d", id)
+    for i in range(TRIES):
+        try:
+            raw_json = yga.messages(id, 'raw')
+            with open("%s_raw.json" % (id,), 'wb') as f:
+                json.dump(raw_json, codecs.getwriter('utf-8')(f), ensure_ascii=False, indent=4)
+            break
+        except requests.exceptions.ReadTimeout:
+            logger.exception("Read timeout for raw message %d, retrying", id)
+            time.sleep(HOLDOFF)
+        except requests.exceptions.HTTPError:
+            logger.exception("Raw grab failed for message %d", id)
+            break
+
+    logger.info("Fetching html message #%d", id)
+    for i in range(TRIES):
+        try:
+            html_json = yga.messages(id)
+            with open("%s.json" % (id,), 'wb') as f:
+                json.dump(html_json, codecs.getwriter('utf-8')(f), ensure_ascii=False, indent=4)
+
+            if 'attachmentsInfo' in html_json:
+                with Mkchdir("%d_attachments" % id):
+                    process_single_attachment(yga, html_json['attachmentsInfo'])
+
+            break
+        except requests.exceptions.ReadTimeout:
+            logger.exception("Read timeout for html message %d, retrying", id)
+            time.sleep(HOLDOFF)
+        except requests.exceptions.HTTPError:
+            logger.exception("HTML grab failed for message %d", id)
+            break
+
+
+def archive_email(yga, message_subset=None):
     logger = logging.getLogger('archive_email')
     try:
-        msg_json = yga.messages()
+        yga.messages()
     except requests.exceptions.HTTPError as err:
         logger.error("User doesn't have permission to access Messages in this group", err.message)
         return
 
-    count = msg_json['totalRecords']
+    if message_subset is None:
+        message_subset = archive_messages_metadata(yga)
+        logger.info("Group has %s messages (maximum id: %s), fetching all", len(message_subset), message_subset[-1])
 
-    msg_json = yga.messages(count=count)
-    logger.info("Group has %s messages, got %s", count, msg_json['numRecords'])
-
-    for message in msg_json['messages']:
-        id = message['messageId']
-
-        logger.info("Fetching raw message #%d of %d", id, count)
-        for i in range(TRIES):
-            try:
-                raw_json = yga.messages(id, 'raw')
-                break
-            except requests.exceptions.ReadTimeout:
-                logger.error("Read timeout for raw message %d of %d, retrying", id, count)
-                time.sleep(HOLDOFF)
-            except requests.exceptions.HTTPError as err:
-                logger.error("Raw grab failed for message %d of %d", id, count)
-                break
-        if html:
-            logger.info("* Fetching html message #%d of %d", id, count)
-            for i in range(TRIES):
-                try:
-                    html_json = yga.messages(id)
-                    break
-                except requests.exceptions.ReadTimeout:
-                    logger.error("Read timeout for html message %d of %d, retrying", id, count)
-                    time.sleep(HOLDOFF)
-                except requests.exceptions.HTTPError:
-                    logger.error("HTML grab failed for message %d of %d", id, count)
-                    break
-
-        if save and message['hasAttachments']:
-            if 'attachments' not in message:
-                logger.warning("Yahoo says this message (%d of %d) has attachments, but I can't find any!", id, count)
-            else:
-                with Mkchdir("%d_attachments" % id):
-                    process_single_attachment(yga, message['attachments'])
-
-        with open("%s_raw.json" % (id,), 'wb') as f:
-            json.dump(raw_json, codecs.getwriter('utf-8')(f), ensure_ascii=False, indent=4)
-
-        if html:
-            with open("%s.json" % (id,), 'wb') as f:
-                json.dump(html_json, codecs.getwriter('utf-8')(f), ensure_ascii=False, indent=4)
-
+    for id in message_subset:
+        try:
+            archive_message_content(yga, id)
+        except Exception:
+            logger.exception("Failed to get message id: %d", id)
+            continue
 
 def process_single_attachment(yga, attach):
     logger = logging.getLogger(name="process_single_attachment")
     for frec in attach:
         logger.info("Fetching attachment '%s'", frec['filename'])
         fname = "%s-%s" % (frec['fileId'], basename(frec['filename']))
+        fname = re.sub(r'[\/*?:"<>|-]',"",fname)
         with open(fname, 'wb') as f:
             if 'link' in frec:
             # try and download the attachment
@@ -243,6 +271,7 @@ def archive_photos(yga):
 
                     photoinfo = get_best_photoinfo(photo['photoInfo'])
                     fname = "%d-%s.jpg" % (photo['photoId'], basename(pname))
+                    fname = re.sub(r'[\/*?:"<>|-]',"",fname)
                     with open(fname, 'wb') as f:
                         for i in range(TRIES):
                             try:
@@ -501,10 +530,10 @@ class Mkchdir:
 
     def __enter__(self):
         try:
-            os.mkdir(self.d)
+            os.mkdir(re.sub(r'[\\/*?:"<>|-]',"",self.d))
         except OSError:
             pass
-        os.chdir(self.d)
+        os.chdir(re.sub(r'[\\/*?:"<>|-]',"",self.d))
 
     def __exit__(self, exc_type, exc_value, traceback):
         os.chdir('..')
@@ -576,12 +605,6 @@ if __name__ == "__main__":
     po.add_argument('-m', '--members', action='store_true',
                     help='Only archive members')
 
-    pe = p.add_argument_group(title='Email Options')
-    pe.add_argument('-s', '--no-save', action='store_true',
-                    help="Don't save email attachments as individual files")
-    pe.add_argument('--html', action='store_false',
-                    help="Don't save the non-raw version of message")
-
     pf = p.add_argument_group(title='Output Options')
     pf.add_argument('-w', '--warc', action='store_true',
                     help='Output WARC file of raw network requests. [Requires warcio package installed]')
@@ -620,7 +643,7 @@ if __name__ == "__main__":
 
         if args.email:
             with Mkchdir('email'):
-                archive_email(yga, save=(not args.no_save), html=args.html)
+                archive_email(yga)
         if args.files:
             with Mkchdir('files'):
                 archive_files(yga)
